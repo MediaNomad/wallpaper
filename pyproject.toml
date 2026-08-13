@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "museum-wallpaper"
+version = "3.0.0"
+description = "Set public-domain museum art as your macOS or Windows wallpaper."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "certifi>=2024.2.2",
+  "Pillow>=10.2,<13",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+]
+
+[project.scripts]
+wallpaper = "wallpaper:main"
+
+[tool.setuptools]
+py-modules = ["wallpaper"]
