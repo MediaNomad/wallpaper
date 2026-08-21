@@ -24,7 +24,14 @@ from PIL import Image, UnidentifiedImageError
 APP_NAME = "wallpaper"
 APP_VERSION = "3.0.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (cross-platform museum wallpaper client)"
-SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+# Windows manages trusted certificates in the system certificate store.  Using
+# only certifi's bundled roots breaks on otherwise trusted networks that add a
+# local root certificate (for example, an HTTPS-filtering proxy).
+SSL_CONTEXT = (
+    ssl.create_default_context()
+    if os.name == "nt"
+    else ssl.create_default_context(cafile=certifi.where())
+)
 MET_API_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
 CLEVELAND_API_BASE = "https://openaccess-api.clevelandart.org/api"
 CHICAGO_API_BASE = "https://api.artic.edu/api/v1"
@@ -69,6 +76,7 @@ IMAGE_DIR = HOME / "Pictures" / "Wallpapers"
 LAUNCH_AGENT = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LAST_PATH = STATE_DIR / "last.json"
+HISTORY_PATH = STATE_DIR / "history.json"
 LEGACY_CONFIG_PATH = HOME / ".config" / "met-wallpaper" / "config.json"
 LEGACY_LAST_PATH = HOME / ".local" / "state" / "met-wallpaper" / "last.json"
 
@@ -86,6 +94,8 @@ DEFAULT_CONFIG = {
     "minimum_image_width": 3840,
     "max_object_attempts": 50,
     "cache_ttl_seconds": 86400,
+    "recent_history_size": 50,
+    "download_attempts": 12,
 }
 
 
@@ -503,6 +513,16 @@ def make_candidate(
     }
 
 
+def artwork_key(obj):
+    source = str(obj.get("_source") or obj.get("source") or "").strip()
+    source_object_id = obj.get("sourceObjectID") or obj.get("source_object_id")
+    object_id = str(obj.get("objectID") or obj.get("object_id") or "").strip()
+    if not source_object_id and source and object_id.startswith(f"{source}-"):
+        source_object_id = object_id[len(source) + 1 :]
+    source_object_id = str(source_object_id or object_id).strip()
+    return f"{source}:{source_object_id}" if source and source_object_id else object_id
+
+
 def fields_contain_query(fields, query_terms):
     object_terms = set()
     for field in fields:
@@ -749,6 +769,18 @@ def linked_art_content(items, *, english=True):
     return clean_text(values[0].get("content")) if values else ""
 
 
+def linked_art_timespan_content(timespans):
+    if isinstance(timespans, dict):
+        timespans = [timespans]
+    for timespan in timespans or []:
+        if not isinstance(timespan, dict):
+            continue
+        content = linked_art_content(timespan.get("identified_by"))
+        if content:
+            return content
+    return ""
+
+
 def rijks_object_url(obj):
     for subject in obj.get("subject_of") or []:
         for carrier in subject.get("digitally_carried_by") or []:
@@ -807,8 +839,7 @@ def rijks_candidate(identifier, config):
             artist = linked_art_content(part.get("referred_to_by"))
             if artist:
                 break
-    timespan = production.get("timespan") or {}
-    date = linked_art_content(timespan.get("identified_by"))
+    date = linked_art_timespan_content(production.get("timespan"))
     title = linked_art_content(obj.get("identified_by"))
     object_id = str(obj.get("id") or identifier).rstrip("/").rsplit("/", 1)[-1]
     search_values = [
@@ -950,13 +981,16 @@ def search_commons_candidates(config):
     return candidates
 
 
-def pick_met_object(config):
+def pick_met_object(config, excluded_keys=None):
+    excluded_keys = set(excluded_keys or ())
     object_ids = search_objects(config)
     attempts = min(int(config.get("max_object_attempts", 50)), len(object_ids))
     matches = []
     missing_objects = 0
     highest_rank = 0
     for object_id in object_ids[:attempts]:
+        if f"met:{object_id}" in excluded_keys:
+            continue
         try:
             obj = get_object(object_id, config)
         except WallpaperError as exc:
@@ -1001,15 +1035,21 @@ PROVIDER_SEARCHERS = {
 }
 
 
-def pick_object(config):
+def pick_object(config, excluded_keys=None):
+    excluded_keys = set(excluded_keys or ())
     sources = normalize_sources(config.get("sources"))
     source_order = random.sample(sources, len(sources)) if len(sources) > 1 else sources
     failures = []
     for source in source_order:
         try:
             if source == "met":
-                return pick_met_object(config)
+                return pick_met_object(config, excluded_keys)
             candidates = PROVIDER_SEARCHERS[source](config)
+            candidates = [
+                candidate
+                for candidate in candidates
+                if artwork_key(candidate) not in excluded_keys
+            ]
             if not candidates:
                 failures.append(
                     f"{SOURCE_LABELS[source]}: no matching public-domain image"
@@ -1030,6 +1070,89 @@ def pick_object(config):
 
     details = "; ".join(failures)
     raise WallpaperError(f"No matching public-domain image found. {details}")
+
+
+def load_history():
+    entries = []
+    if HISTORY_PATH.exists():
+        try:
+            with HISTORY_PATH.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, list):
+                entries = [entry for entry in loaded if isinstance(entry, dict)]
+        except (OSError, json.JSONDecodeError):
+            entries = []
+    if not entries and LAST_PATH.exists():
+        try:
+            with LAST_PATH.open("r", encoding="utf-8") as handle:
+                last = json.load(handle)
+            if isinstance(last, dict):
+                entries = [last]
+        except (OSError, json.JSONDecodeError):
+            pass
+    return entries
+
+
+def recent_artwork_keys(config):
+    limit = max(1, int(config.get("recent_history_size", 50)))
+    return {
+        key
+        for entry in load_history()[-limit:]
+        if (key := artwork_key(entry))
+    }
+
+
+def record_history(summary, config):
+    ensure_dirs()
+    history = load_history()
+    key = artwork_key(summary)
+    history = [entry for entry in history if artwork_key(entry) != key]
+    history.append(summary)
+    limit = max(1, int(config.get("recent_history_size", 50)))
+    history = history[-limit:]
+    tmp = HISTORY_PATH.with_name(f"{HISTORY_PATH.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp.replace(HISTORY_PATH)
+
+
+def select_and_download_artwork(config):
+    recent_keys = recent_artwork_keys(config)
+    failed_keys = set()
+    excluded_keys = set(recent_keys)
+    failures = []
+    relaxed_history = False
+    attempts = max(1, int(config.get("download_attempts", 12)))
+
+    for _ in range(attempts):
+        try:
+            obj, image_url = pick_object(config, excluded_keys)
+        except WallpaperError as exc:
+            if recent_keys and not relaxed_history:
+                excluded_keys = set(failed_keys)
+                relaxed_history = True
+                continue
+            if failures:
+                details = "; ".join(failures[-4:])
+                raise WallpaperError(
+                    f"No downloadable artwork found after retries. {details}"
+                ) from exc
+            raise
+
+        key = artwork_key(obj)
+        try:
+            return obj, download_artwork(obj, image_url, config)
+        except WallpaperError as exc:
+            failed_keys.add(key)
+            excluded_keys.add(key)
+            label = obj.get("_sourceLabel") or obj.get("_source") or "source"
+            failures.append(f"{label}: {exc}")
+
+    details = "; ".join(failures[-4:])
+    raise WallpaperError(
+        f"No downloadable artwork found after {attempts} attempts. {details}"
+    )
 
 
 def download_artwork(obj, image_url, config):
@@ -1093,6 +1216,7 @@ def artwork_summary(obj, image_path, config):
         "set_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "image_path": str(image_path),
         "object_id": obj.get("objectID"),
+        "source_object_id": obj.get("sourceObjectID"),
         "title": obj.get("title"),
         "artist": obj.get("artistDisplayName"),
         "date": obj.get("objectDate"),
@@ -1165,15 +1289,15 @@ def next_wallpaper(args):
     if getattr(args, "save", False) and changed:
         save_config(config)
 
-    obj, image_url = pick_object(config)
-    image_path = download_artwork(obj, image_url, config)
+    obj, image_path = select_and_download_artwork(config)
     if args.download_only:
-        print(
-            format_last(artwork_summary(obj, image_path, config), prefix="Downloaded")
-        )
+        summary = artwork_summary(obj, image_path, config)
+        record_history(summary, config)
+        print(format_last(summary, prefix="Downloaded"))
         return
     set_wallpaper(image_path)
     last = write_last(obj, image_path, config)
+    record_history(last, config)
     print(format_last(last, prefix="Set"))
 
 
